@@ -1,0 +1,188 @@
+var SPREADSHEET_URL = 'YOUR_SPREADSHEET_URL';
+var CAMPAIGN_NAME = 'YOUR_CAMPAIGN_NAME';
+
+function main() {
+  validateCampaignName();
+  Logger.log('Using spreadsheet - %s.', SPREADSHEET_URL);
+  var spreadsheet = validateAndGetSpreadsheet(SPREADSHEET_URL);
+  spreadsheet.setSpreadsheetTimeZone(AdsApp.currentAccount().getTimeZone());
+
+  var multipliersSheet = spreadsheet.getSheetByName('Multipliers');
+
+  var multipliers = multipliersSheet.getDataRange().getValues();
+  // Find if we have a multiplier left to apply.
+  var multiplierRow = 1;
+  for (; multiplierRow < multipliers.length; multiplierRow++) {
+    // if we haven't marked a multiplier as applied, use it.
+    if (!multipliers[multiplierRow][1]) {
+      break;
+    }
+  }
+
+  var today = Utilities.formatDate(new Date(),
+      AdsApp.currentAccount().getTimeZone(), 'yyyyMMdd');
+
+  var shouldReport = multiplierRow > 1;
+  var shouldIncreaseBids = multiplierRow < multipliers.length;
+  var finishedReporting = multipliersSheet.getSheetProtection().isProtected();
+
+  if (shouldReport && !finishedReporting) {
+    // If we have at least one multiplier marked as applied,
+    // let's record performance since the last time we ran.
+    var lastRun = multipliers[multiplierRow - 1][1];
+    if (lastRun == today) {
+      Logger.log('Already ran today, skipping');
+      return;
+    }
+    outputReport(spreadsheet, lastRun, today);
+
+    if (!shouldIncreaseBids) {
+      // We've reported one iteration after we finished bids, so mark the sheet
+      // protected.
+      var permissions = multipliersSheet.getSheetProtection();
+      permissions.setProtected(true);
+      multipliersSheet.setSheetProtection(permissions);
+      Logger.log('View bid testing results here: ' + SPREADSHEET_URL);
+    }
+  }
+
+  if (shouldIncreaseBids) {
+    // If we have a multiplier left to apply, let's do so.
+    updateBids(spreadsheet, multipliers[multiplierRow][0]);
+    multipliers[multiplierRow][1] = today;
+    // Mark multiplier as applied.
+    multipliersSheet.getDataRange().setValues(multipliers);
+  }
+
+  if (finishedReporting) {
+    Logger.log('Script complete, all bid modifiers tested and reporting. ' +
+      'Please remove this script\'s schedule.');
+  }
+}
+
+function updateBids(spreadsheet, multiplier) {
+  Logger.log('Applying bid multiplier of ' + multiplier);
+
+  var startingBids = getStartingBids(spreadsheet);
+  if (!startingBids) {
+    startingBids = recordStartingBids(spreadsheet);
+  }
+  var campaign = getCampaign();
+  var keywordIter = campaign.keywords().get();
+  while (keywordIter.hasNext()) {
+    var keyword = keywordIter.next();
+    var oldBid = startingBids[keyword.getText()];
+    if (!oldBid) {
+      // If we don't have a starting bid, keyword has been added since we
+      // started testing.
+      oldBid = keyword.bidding().getCpc() || keyword.getAdGroup().bidding().getCpc();
+      startingBids[keyword.getText()] = oldBid;
+    }
+    var newBid = oldBid * multiplier;
+    keyword.bidding().setCpc(newBid);
+  }
+  saveStartingBids(spreadsheet, startingBids);
+}
+
+function outputReport(spreadsheet, start, end) {
+  Logger.log('Reporting on ' + start + ' -> ' + end);
+
+  // Create a new sheet to output keywords to.
+  var reportSheet = spreadsheet.insertSheet(start + ' - ' + end);
+  var campaign = getCampaign();
+
+  var rows = [['Keyword', 'Max CPC', 'Clicks', 'Impressions', 'Ctr']];
+  var keywordIter = campaign.keywords().get();
+  while (keywordIter.hasNext()) {
+    var keyword = keywordIter.next();
+    var stats = keyword.getStatsFor(start, end);
+    rows.push([keyword.getText(), keyword.bidding().getCpc(), stats.getClicks(),
+        stats.getImpressions(), stats.getCtr()]);
+  }
+
+  reportSheet.getRange(1, 1, rows.length, 5).setValues(rows);
+}
+
+function recordStartingBids(spreadsheet) {
+  var startingBids = {};
+  var keywords = getCampaign().keywords().get();
+  while (keywords.hasNext()) {
+    var keyword = keywords.next();
+    var bid = keyword.bidding().getCpc() || keyword.getAdGroup().bidding().getCpc();
+    startingBids[keyword.getText()] = bid;
+  }
+  saveStartingBids(spreadsheet, startingBids);
+  return startingBids;
+}
+
+function getStartingBids(spreadsheet) {
+  var sheet = spreadsheet.getSheetByName('Starting Bids');
+  if (!sheet) {
+    return;
+  }
+  var rawData = sheet.getDataRange().getValues();
+  var startingBids = {};
+  for (var i = 0; i < rawData.length; i++) {
+    startingBids[rawData[i][0]] = rawData[i][1];
+  }
+  return startingBids;
+}
+
+function saveStartingBids(spreadsheet, startingBids) {
+  var sheet = spreadsheet.getSheetByName('Starting Bids');
+  if (!sheet) {
+    sheet = spreadsheet.insertSheet('Starting Bids');
+  }
+  var rows = [];
+  for (var keyword in startingBids) {
+    rows.push([keyword, startingBids[keyword]]);
+  }
+  sheet.getRange(1, 1, rows.length, 2).setValues(rows);
+}
+
+function dateToString(date) {
+  return date.getFullYear() + zeroPad(date.getMonth() + 1) +
+      zeroPad(date.getDate());
+}
+
+function zeroPad(n) {
+  if (n < 10) {
+    return '0' + n;
+  } else {
+    return '' + n;
+  }
+}
+
+function getCampaign() {
+  return AdsApp.campaigns().withCondition("Name = '" +
+      CAMPAIGN_NAME + "'").get().next();
+}
+
+/**
+ * Validates the provided campaign name and throws a descriptive error
+ * if the user has not changed the email from the default fake name.
+ *
+ * @throws {Error} If the name is the default fake name.
+ */
+function validateCampaignName(){
+  if (CAMPAIGN_NAME == "YOUR_CAMPAIGN_NAME") {
+    throw new Error('Please use a valid campaign name.');
+  }
+}
+
+/**
+ * Validates the provided spreadsheet URL
+ * to make sure that it's set up properly. Throws a descriptive error message
+ * if validation fails.
+ *
+ * @param {string} spreadsheeturl The URL of the spreadsheet to open.
+ * @return {Spreadsheet} The spreadsheet object itself, fetched from the URL.
+ * @throws {Error} If the spreadsheet URL hasn't been set
+ */
+function validateAndGetSpreadsheet(spreadsheeturl) {
+  if (spreadsheeturl == 'YOUR_SPREADSHEET_URL') {
+    throw new Error('Please specify a valid Spreadsheet URL. You can find' +
+        ' a link to a template in the associated guide for this script.');
+  }
+  return SpreadsheetApp.openByUrl(spreadsheeturl);
+}
