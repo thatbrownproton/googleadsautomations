@@ -1,0 +1,2 @@
+# googleadsautomations
+Scripts for automations
