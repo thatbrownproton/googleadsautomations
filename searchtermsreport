@@ -1,0 +1,615 @@
+/**
+ * @name Search Term Trends Report
+ * 
+ * @overview Compare search term performance for the given two date ranges.
+ * Exports the results to a spreadsheet in your Google Drive folder.
+ * The report is generated for account-level data.
+ * 
+ * 
+ * Please send in your comment, feedback, criticism or occasional Thank You 
+ * to support@karooya.com
+ * 
+ * @author Karooya Team [support@karooya.com]
+ *
+ * All AdWords scripts published by Karooya are available here 
+ * http://www.karooya.com/blog/category/karooya-adwords-script/ 
+ *
+ * Copyright (c) 2020 - Karooya Technologies Pvt. Ltd.  All Rights Reserved.
+ * http://www.karooya.com
+ * 
+ * The script was last modified on: 27 July, 2020
+ */
+
+// Path to the folder in Google Drive where all the reports are to be created
+var REPORTS_FOLDER_PATH = 'Search Term Trend Reports';
+
+// Or specify a custom date range. Format is: YYYY-MM-DD
+var USE_CUSTOM_DATE_RANGE = false;
+var START_DATE1 = "<Date in yyyy-mm-dd format>"; // Example "2020-05-01"
+var END_DATE1 = "<Date in yyyy-mm-dd format>"; // Example "2020-05-31"
+var START_DATE2 = "<Date in yyyy-mm-dd format>"; // Example "2020-04-01"
+var END_DATE2 = "<Date in yyyy-mm-dd format>"; // Example "2020-04-30"
+
+//Specify a date range for the report 
+var DATE_RANGE = "LAST_7_DAYS_VS_PREV"; // Other allowed values are: LAST_<NUM>_DAYS_VS_PREV (Ex: LAST_90_DAYS_VS_PREV, LAST_30_DAYS_VS_PREV, etc.) 
+
+var MIN_IMPRESSIONS = 50; // Exclude search terms having less than the minimum impressions 
+
+// Sort the search terms in the report by
+var SORT_BY_FIELD = "Impressions"; // Allowed field names are "Impressions", "Clicks", "Cost", "Conversions"
+var SORT_ORDER = "DESC"; // Allowed values are "ASCE" or "DESC"
+
+// Email recipient: Edit the following value to add your email ID(s). 
+// Example 'a@b.c' or 'a@b.c, x@y.z'
+var SEND_EMAIL_ALERT = true; // Send alert if there are any new recommendations
+var EMAIL_RECIPIENT = '<INSERT YOUR EMAIL ID HERE>';
+
+/*-- More filter for MCC account --*/
+//Is your account a MCC account
+var IS_MCC_ACCOUNT = false;
+
+var FILTER_ACCOUNTS_BY_LABEL = false;
+var ACCOUNT_LABEL_TO_SELECT = "INSERT_LABEL_NAME_HERE";
+
+var FILTER_ACCOUNTS_BY_IDS = false;
+var ACCOUNT_IDS_TO_SELECT = ['INSERT_ACCOUNT_ID_HERE', 'INSERT_ACCOUNT_ID_HERE'];
+/*---------------------------------*/
+
+//The script is expected to work with following API version
+var API_VERSION = {
+  apiVersion: 'v201809'
+}
+
+//////////////////////////////////////////////////////////////////////////////
+function main() {
+  var reportsFolder = getFolder(REPORTS_FOLDER_PATH);
+  var spreadsheet = getReportSpreadsheet(reportsFolder);
+  
+  var reportSummaryArray = new Array();
+  if (!IS_MCC_ACCOUNT) {
+    var reportSummary = processCurrentAccount(spreadsheet);
+    reportSummaryArray.push(reportSummary);
+  } else {
+    var childAccounts  = getManagedAccounts();
+    while(childAccounts.hasNext()) {
+      var childAccount  = childAccounts .next()
+      MccApp.select(childAccount);
+      var reportSummary = processCurrentAccount(spreadsheet);
+      reportSummaryArray.push(reportSummary);
+    }
+  }
+  
+  addSummarySheet(spreadsheet, reportSummaryArray);
+  
+  if (isEmailConfigured()) {
+    sendEmailAlert(reportSummaryArray, reportsFolder.getUrl());
+  }
+  
+  trackEventInAnalytics();
+  Logger.log("Done!");
+  Logger.log("=========================");
+  Logger.log("All the reports are available in the Google Drive folder at following URL: ");
+  Logger.log(reportsFolder.getUrl());
+  if (!isEmailConfigured()) {
+    Logger.log("");
+    Logger.log("Note: You can configure the following two variables in the script to receive an email notification when the script completes execution - SEND_EMAIL_ALERT, EMAIL_RECIPIENT.");
+  }
+  Logger.log("=========================");
+}
+
+function getManagedAccounts() {
+  var accountSelector = MccApp.accounts();
+  if (FILTER_ACCOUNTS_BY_IDS) {
+    accountSelector = accountSelector.withIds(ACCOUNT_IDS_TO_SELECT);
+  }
+  if (FILTER_ACCOUNTS_BY_LABEL) {
+    accountSelector = accountSelector.withCondition("LabelNames CONTAINS '" + ACCOUNT_LABEL_TO_SELECT + "'")
+  }
+  return accountSelector.get();  
+}
+
+function processCurrentAccount(spreadsheet) {
+  var adWordsAccount = AdWordsApp.currentAccount();
+
+  var accountName = adWordsAccount.getName();
+  var currencyCode = adWordsAccount.getCurrencyCode();
+  Logger.log("Accessing AdWord account: " + accountName);
+
+  var dateRanges = getDateRanges(",");
+  
+  Logger.log("Fetching data for date range: " + dateRanges.dateRange1);
+  var searchTermReport1 = getSearchTermsReport(dateRanges.dateRange1);
+
+  Logger.log("Fetching data for date range: " + dateRanges.dateRange2);
+  var searchTermReport2 = getSearchTermsReport(dateRanges.dateRange2);
+
+  Logger.log("Computing..");
+  var report = compute(searchTermReport1, searchTermReport2);
+
+  Logger.log("Exporting report for " + accountName + " to spreadsheet..");
+  var newSheetName = accountName;
+  var sheet = getSheetByName(spreadsheet, newSheetName);
+  
+  exportToSpreadsheet(report, sheet, currencyCode);
+
+  /* Export raw data (for debugging) 
+  var sheet1 = getSheetByName(spreadsheet, newSheetName + "-DateRange1");
+  var sheet2 = getSheetByName(spreadsheet, newSheetName + "-DateRange2");
+  searchTermReport1.exportToSheet(sheet1);
+  searchTermReport2.exportToSheet(sheet2);
+  */
+  var recoSummary = {
+    'accountName': accountName,
+    'topSearchTermsLosingImpressions' : report.topSearchTermsLosingImpressions
+  };  
+  return recoSummary;
+}
+
+function compute(searchTermReport1, searchTermReport2) {
+  var searchTermCompareMap = new Object();
+  
+  // Add search terms from report1 to a map as 'perf1'
+  var reportIterator = searchTermReport1.rows();
+  while (reportIterator.hasNext()) {
+    var st = reportIterator.next();
+    addToSearchTermCompareMap(searchTermCompareMap, st, "perf1");
+  }
+  
+  // Add search terms from report2 to the map as 'perf2'
+  reportIterator = searchTermReport2.rows();
+  while (reportIterator.hasNext()) {
+    var st = reportIterator.next();
+    addToSearchTermCompareMap(searchTermCompareMap, st, "perf2");
+  }
+ 
+  var searchTermCompareArray = new Array();
+  for (var mapKey in searchTermCompareMap) {
+    if (searchTermCompareMap.hasOwnProperty(mapKey)) {
+      var searchTermCompare = searchTermCompareMap[mapKey];
+      computeChange(searchTermCompare);
+      searchTermCompareArray.push(searchTermCompare);
+    }
+  }
+  Logger.log("Found total " + searchTermCompareArray.length + " search terms");
+  
+  var topSearchTermsLosingImpressions = getTopSearchTermsLosingImpressions(searchTermCompareArray);
+  
+  // Sort by SORT_BY_FIELD of perf1 (DESC)
+  searchTermCompareArray.sort(function(stc1, stc2) {
+    var val1 = (stc1.perf1) ? stc1.perf1[SORT_BY_FIELD] : 0;
+    var val2 = (stc2.perf1) ? stc2.perf1[SORT_BY_FIELD] : 0;
+    var res = val1 - val2;
+    if (SORT_ORDER == "DESC") {
+      res *= -1;
+    }
+    return res;
+  });
+  
+  var report = new Object();
+  report.searchTermCompareArray = searchTermCompareArray;
+  report.topSearchTermsLosingImpressions = topSearchTermsLosingImpressions;
+  return report;
+}
+
+function getTopSearchTermsLosingImpressions(searchTermCompareArray) {
+  var MAX_SEARCH_TERMS_TO_SHOW = 10;
+  
+  // Sort by absolute difference (ASC)
+  Logger.log("Checking top " + MAX_SEARCH_TERMS_TO_SHOW + " search terms that lost most impressions..");
+  searchTermCompareArray.sort(function(stc1, stc2) {
+    return stc1.absChange.Impressions - stc2.absChange.Impressions;
+  });
+  
+  var count = 0;
+  for(var i =0; i < MAX_SEARCH_TERMS_TO_SHOW; i++) {
+    if (searchTermCompareArray[i].absChange.Impressions >= 0) {
+      break;
+    }
+    count++;
+  } 
+  return searchTermCompareArray.slice(0, Math.min(count));
+}
+
+function computeChange(searchTermCompare) {
+  var fieldNames = getPerfFields();
+  var absChange = new Object();
+  var percentChange = new Object();
+  for(var i=0; i<fieldNames.length; i++) {
+    var val1 = (searchTermCompare.perf1) ? searchTermCompare.perf1[fieldNames[i]] : 0;
+    var val2 = (searchTermCompare.perf2) ? searchTermCompare.perf2[fieldNames[i]] : 0;
+    absChange[fieldNames[i]] = val1 - val2;
+    percentChange[fieldNames[i]] = (val2 > 0) ? (val1 - val2) / val2 : ((val1 == 0) ? 0 : 1);  
+  }
+  searchTermCompare.absChange = absChange;
+  searchTermCompare.percentChange = percentChange;
+}
+
+function addToSearchTermCompareMap(searchTermCompareMap, st, perfFieldName) {
+  var mapKey = st["Query"];
+  var searchTermCompare = searchTermCompareMap[mapKey];
+  if(!searchTermCompare) {
+    searchTermCompare = {
+      "Query": st["Query"]
+    };
+    searchTermCompareMap[mapKey] = searchTermCompare;
+  }
+  searchTermCompare[perfFieldName] = {
+      "Impressions" : cleanAndParseInt(st["Impressions"]),
+      "Clicks" : cleanAndParseInt(st["Clicks"]),
+      "Conversions" : cleanAndParseFloat(st["Conversions"]),
+      "Cost" : cleanAndParseFloat(st["Cost"])
+    };
+}
+
+function getSearchTermsReport(dateRange) {
+  var whereStatements = "";
+  if (MIN_IMPRESSIONS > 0) {
+    whereStatements = " WHERE Impressions > " + MIN_IMPRESSIONS;
+  }
+  var query = "SELECT Query, Impressions, Clicks, Conversions, Cost " +
+    " FROM  SEARCH_QUERY_PERFORMANCE_REPORT " +
+    whereStatements + 
+    " DURING " + dateRange;
+  Logger.log("AWQL query: " + query);
+  return AdWordsApp.report(query, API_VERSION);
+}
+
+function exportToSpreadsheet(report, sheet, currencyCode) {
+  var colTitleColor = "#03cfcc"; // Aqua
+  var summaryRowColor = "#D3D3D3"; // Grey
+  var oddRowColor = "#FFFFFF";
+  var evenRowColor = "#EFEFEF";
+  var headers = getPerfColHeaders(currencyCode);
+  var dateRanges = getDateRanges("-");
+  var tableHeaderRowPos = 1;
+
+  // Add two-line headers
+  sheet.getRange(tableHeaderRowPos, 1, 1, 1).setValue("Query").setBackground(colTitleColor).setFontWeight("BOLD").setWrap(true).setHorizontalAlignment("center").setVerticalAlignment("middle");
+  sheet.getRange(tableHeaderRowPos + 1, 1, 1, 1).setValue("").setBackground(colTitleColor).setFontWeight("BOLD").setWrap(true).setHorizontalAlignment("center").setVerticalAlignment("middle");
+  for(var i=0; i<headers.length; i++) {
+    var perfColStart = (i*4) + 2;
+    sheet.getRange(tableHeaderRowPos, perfColStart, 1, 4).merge().setValue(headers[i]).setBackground(colTitleColor).setFontWeight("BOLD").setWrap(true).setHorizontalAlignment("center").setVerticalAlignment("middle");
+    sheet.getRange(tableHeaderRowPos+1, perfColStart++, 1, 1).setValue(dateRanges.dateRange1).setBackground(colTitleColor).setFontWeight("BOLD").setWrap(true).setHorizontalAlignment("center").setVerticalAlignment("middle");
+    sheet.getRange(tableHeaderRowPos+1, perfColStart++, 1, 1).setValue(dateRanges.dateRange2).setBackground(colTitleColor).setFontWeight("BOLD").setWrap(true).setHorizontalAlignment("center").setVerticalAlignment("middle");
+    sheet.getRange(tableHeaderRowPos+1, perfColStart++, 1, 1).setValue("Change Abs").setBackground(colTitleColor).setFontWeight("BOLD").setWrap(true).setHorizontalAlignment("center").setVerticalAlignment("middle");
+    sheet.getRange(tableHeaderRowPos+1, perfColStart++, 1, 1).setValue("Change %").setBackground(colTitleColor).setFontWeight("BOLD").setWrap(true).setHorizontalAlignment("center").setVerticalAlignment("middle");
+  }
+  
+  var searchTermCompareArray = report.searchTermCompareArray;
+
+  var rowIdx = tableHeaderRowPos+2;
+  for(var i=0; i<searchTermCompareArray.length; i++) {
+    var searchTermCompare = searchTermCompareArray[i];
+    var bgColor = (i % 2) ? evenRowColor : oddRowColor;
+    var row = getStatsRow(searchTermCompare);
+    sheet.getRange(rowIdx, 1, 1, (headers.length * 4) + 1).setValues([row]).setBackground(bgColor).setFontWeight("BOLD");
+    var imprStatsBgColor = getBgColorForImpressionsStats(searchTermCompare);
+    if (imprStatsBgColor) {
+      sheet.getRange(rowIdx, 2, 1, 4).setBackground(imprStatsBgColor);
+    }
+    rowIdx++;
+  }
+  
+  sheet.getRange(tableHeaderRowPos+2, 2, rowIdx-(tableHeaderRowPos+2), 3).setNumberFormat("###,##0"); // three columns
+  sheet.getRange(tableHeaderRowPos+2, 5, rowIdx-(tableHeaderRowPos+2), 1).setNumberFormat("0.0%");
+  sheet.getRange(tableHeaderRowPos+2, 6, rowIdx-(tableHeaderRowPos+2), 3).setNumberFormat("###,##0"); // three columns
+  sheet.getRange(tableHeaderRowPos+2, 9, rowIdx-(tableHeaderRowPos+2), 1).setNumberFormat("0.0%");
+  sheet.getRange(tableHeaderRowPos+2, 10, rowIdx-(tableHeaderRowPos+2), 3).setNumberFormat("###,##0.00");
+  sheet.getRange(tableHeaderRowPos+2, 13, rowIdx-(tableHeaderRowPos+2), 1).setNumberFormat("0.0%");
+  sheet.getRange(tableHeaderRowPos+2, 14, rowIdx-(tableHeaderRowPos+2), 3).setNumberFormat("###,##0.00");
+  sheet.getRange(tableHeaderRowPos+2, 17, rowIdx-(tableHeaderRowPos+2), 1).setNumberFormat("0.0%");
+  
+  var colPosition = 1;
+  sheet.setColumnWidth(colPosition++, 35 * 10);
+  
+  sheet.setFrozenRows(2);
+  sheet.setFrozenColumns(1);
+}
+
+function addSummarySheet(spreadsheet, reportSummaryArray) {
+  var sheet = getSheetByName(spreadsheet, "Summary");
+  var headers = ["Query", "Impressions Lost", "Impressions Lost %"];
+  var colTitleColor = "";
+  var rowIdx = 2;
+  for(var i=0; i<reportSummaryArray.length; i++) {
+    var reportSummary = reportSummaryArray[i];
+    var stcArray = reportSummary.topSearchTermsLosingImpressions;
+    sheet.getRange(rowIdx++, 1, 1, 3).merge().setValue(reportSummary.accountName).setFontWeight("BOLD").setFontSize(18);
+    sheet.getRange(rowIdx++, 1, 1, 3).merge().setValue("Top " + stcArray.length + " search terms loosing impressions");
+    sheet.getRange(rowIdx++, 1, 1, headers.length).setValues([headers]).setBackground(colTitleColor).setFontWeight("BOLD").setWrap(true).setHorizontalAlignment("center").setVerticalAlignment("middle");
+    var startRowIdx = rowIdx;
+    for(var stcIdx=0; stcIdx<stcArray.length; stcIdx++) {
+      var stc = stcArray[stcIdx];
+      var rowValues = [stc["Query"], stc.absChange["Impressions"], stc.percentChange["Impressions"]];
+      sheet.getRange(rowIdx++, 1, 1, headers.length).setValues([rowValues]).setBackground(colTitleColor).setWrap(true);
+    }
+    sheet.getRange(startRowIdx, 2, rowIdx-startRowIdx, 1).setNumberFormat("###,##0");
+    sheet.getRange(startRowIdx, 3, rowIdx-startRowIdx, 1).setNumberFormat("0.0%");
+    rowIdx++;rowIdx++;rowIdx++;
+  }
+  
+  var colPosition = 1;
+  sheet.setColumnWidth(colPosition++, 35 * 10);
+}
+
+function sendEmailAlert(reportSummaryArray, reportsFolderUrl) {
+  Logger.log("Sending email alert...");
+  var subject = "Generated Search Term Trends report for your Google Ads account";
+  if (IS_MCC_ACCOUNT) {
+    subject = subject + "s";
+  }
+
+  var html = [];
+  html.push(
+    '<html>',
+      '<head></head>',
+      '<body>',
+        '<table style="font-family:Arial,Helvetica; border-collapse:collapse;font-size:10pt; ' +
+            'color:#444444; border: solid 1px #dddddd;" width="600" cellpadding=20>',
+          '<tr>', '<td>',
+            '<p>Hi,</p>',
+            "<p>This email is sent from Karooya's 'Search Terms Trends' script in your Gogole Ads account.</p>",
+            "<p>There are may ways you can use this report. For example, you can - </p>",
+            "<ul>",
+              "<li>Identify the search terms that are losing impressions</li>",
+              "<li>Monitor how your most expensive/important search terms are converting</li>",
+              "<li>Identify new search terms </li>",
+            "</ul>"
+            
+  );
+  
+  if (reportSummaryArray.length > 0) {
+    html.push(
+        "<p>Here a summary of the report.</p>",
+            getSummaryForAllAccount(reportSummaryArray),
+        '<br\>'
+    );
+  }
+
+  html.push(
+            '<p>The detailed reports are available in a Google Drive folder at the following URL - <a href="' + reportsFolderUrl + '">Search Term Trends Reports</a></p>',
+            "<p>Send us your feedback, comment or success story by email to support@karooya.com.</p>",
+            '<p>-AdWords script courtesy : <a href="www.karooya.com">Karooya</a></p>',
+          '</td>', '</tr>',
+        '</table>',
+      '</body>',
+    '</html>'
+  );
+  
+  MailApp.sendEmail({
+    to: EMAIL_RECIPIENT,
+    subject: subject,
+    htmlBody: html.join('\n')
+  });
+}
+
+function getSummaryForAllAccount(reportSummaryArray) {
+  var html = [];
+  var headers = ["Query", "Impressions Lost", "Impressions Lost %"];
+  for(var i=0; i<reportSummaryArray.length; i++) {
+    var reportSummary = reportSummaryArray[i];
+    var stcArray = reportSummary.topSearchTermsLosingImpressions;
+    html.push('<h3>'); html.push(reportSummary.accountName); html.push('</h3>');
+    html.push('<p>Top '); html.push(stcArray.length); html.push(' search terms loosing impressions</p>');
+    html.push('<table>', '<tr>');
+    for(var h=0; h<headers.length; h++) {
+      html.push('<th>'); html.push(headers[h]); html.push('</th>');
+    }
+    html.push('</tr>');
+    for(var stcIdx=0; stcIdx<stcArray.length; stcIdx++) {
+      html.push('<tr>');
+      var stc = stcArray[stcIdx];
+      html.push('<td>'); html.push(stc["Query"]); html.push('</td>');
+      html.push('<td style="text-align: center;">'); html.push(stc.absChange["Impressions"]); html.push('</td>');
+      html.push('<td style="text-align: center;">'); html.push((stc.percentChange["Impressions"] * 100).toFixed(2)); html.push('%</td>');
+/*      var rowValues = [stc["Query"], stc.absChange["Impressions"], (stc.percentChange["Impressions"] * 100).toFixed(2)];
+      for(var rv=0; rv<rowValues.length; rv++) {
+        html.push('<td>'); html.push(rowValues[rv]); html.push('</td>');
+      }
+*/
+      html.push('</tr>');
+    }
+    html.push('</table>');
+  }
+  return html.join('\n');
+}
+
+function getStatsRow(searchTermCompare) {
+  var rowValArray = new Array();
+  rowValArray.push(searchTermCompare["Query"]);
+  var fieldNames = getPerfFields();
+  for(var i=0; i<fieldNames.length; i++) {
+    rowValArray.push((searchTermCompare.perf1) ? searchTermCompare.perf1[fieldNames[i]] : 0);
+    rowValArray.push((searchTermCompare.perf2) ? searchTermCompare.perf2[fieldNames[i]] : 0);
+    rowValArray.push(searchTermCompare.absChange[fieldNames[i]]);
+    rowValArray.push(searchTermCompare.percentChange[fieldNames[i]]);
+  }
+  return rowValArray;
+}
+
+function getBgColorForImpressionsStats(searchTermCompare) {
+  var percentChange = searchTermCompare.percentChange["Impressions"];
+  if (percentChange > 0.1) { // Increased by more than 10%
+    return "#a5ffa5";
+  } else if (percentChange < -0.1) { // Decreased by more than 10%
+    return "pink";
+  }
+  return undefined;
+}
+
+function getPerfFields(currencyCode) {
+  return [
+    "Impressions",
+    "Clicks",
+    "Conversions",
+    "Cost"   
+    ];
+}
+
+function getPerfColHeaders(currencyCode) {
+  return [
+    "Impressions",
+    "Clicks",
+    "Conversions",
+    "Cost (" + currencyCode + ")"    
+    ];
+}
+
+function getDateRanges(seperator) {
+  var dateRanges = {
+    dateRange1: undefined,
+    dateRange2: undefined
+  };
+
+  var dateRange = DATE_RANGE;
+  if (USE_CUSTOM_DATE_RANGE) {
+    dateRanges.dateRange1 = START_DATE1.replace(/-/g, "") + seperator + END_DATE1.replace(/-/g, "");
+    dateRanges.dateRange2 = START_DATE2.replace(/-/g, "") + seperator + END_DATE2.replace(/-/g, "");
+  } else if (dateRange.match(/LAST_(.*)_DAYS_VS_PREV/)) {
+    var adWordsAccount = AdWordsApp.currentAccount();
+    var MILLIS_PER_DAY = 1000 * 60 * 60 * 24;
+    var numDaysBack = parseInt(dateRange.match(/LAST_(.*)_DAYS_VS_PREV/)[1]);
+    var today = new Date();
+    var endDate1 = Utilities.formatDate(new Date(today.getTime() - MILLIS_PER_DAY), adWordsAccount.getTimeZone(), "yyyyMMdd");// Yesterday
+    var startDate1 = Utilities.formatDate(new Date(today.getTime() - (MILLIS_PER_DAY * numDaysBack)), adWordsAccount.getTimeZone(), "yyyyMMdd");
+    dateRanges.dateRange1 = startDate1 + seperator + endDate1;
+
+    var endDate2 = Utilities.formatDate(new Date(today.getTime() - (MILLIS_PER_DAY * (numDaysBack + 1))), adWordsAccount.getTimeZone(), "yyyyMMdd");
+    var startDate2 = Utilities.formatDate(new Date(today.getTime() - (MILLIS_PER_DAY * (2 * numDaysBack))), adWordsAccount.getTimeZone(), "yyyyMMdd");
+    dateRanges.dateRange2 = startDate2 + seperator + endDate2;
+  }
+  return dateRanges;
+}
+
+//////////////////////////////////////////////////////////////////////////////
+/*
+ * Gets the report file (spreadsheet) for the given date range in the given folder.
+ * Creates a new spreadsheet. Backup old spreadsheet exists.
+ */
+function getReportSpreadsheet(folder) {
+  var dateRanges = getDateRanges("-");
+  var reportFileName = dateRanges.dateRange1 + " vs " + dateRanges.dateRange2; 
+  return createNewSpreadsheet(folder, reportFileName);
+}
+
+/*
+* Gets the folder in Google Drive for the given folderPath.  
+* Creates the folder and all the intermediate folders if needed.
+*/
+function getFolder(folderPath) {
+  var folder = DriveApp.getRootFolder();
+  var folderNamesArray = folderPath.split("/");
+  for(var idx=0; idx < folderNamesArray.length; idx++) {
+    var newFolderName = folderNamesArray[idx];
+    // Skip if new folder name is empty (possibly due to slash at the end) 
+    if (newFolderName.trim() == "") { 
+      continue;
+    }
+    var folderIterator = folder.getFoldersByName(newFolderName);
+    if (folderIterator.hasNext()) {
+      folder = folderIterator.next();
+    } else {
+      Logger.log("Creating folder '" + newFolderName + "'");
+      folder = folder.createFolder(newFolderName);
+    }
+  }
+  return folder;
+}
+
+/*
+ * Create new spreadsheet with given name in the given folder.
+ * Backup old file if exists.
+ */
+function createNewSpreadsheet(folder, fileName) {
+  var spreadsheet = undefined;
+  
+  var files = folder.searchFiles('mimeType = "application/vnd.google-apps.spreadsheet" and title = "'+ fileName + '"');
+  if (files.hasNext()) {
+    var file = files.next();
+    spreadsheet = SpreadsheetApp.open(file);
+    if (spreadsheet) {
+      spreadsheet.rename(fileName + "-bu-ts" + getCurrentTimeStamp());
+    }
+  }
+  
+  spreadsheet = SpreadsheetApp.create(fileName);
+  var file = DriveApp.getFileById(spreadsheet.getId());
+  var oldFolder = file.getParents().next();
+  folder.addFile(file);
+  oldFolder.removeFile(file);  
+  return spreadsheet;
+}
+
+/*
+ * Gets the worksheet from the given spreadsheet and workshee-name.
+ * Creates new worksheet if doesn't exist.
+ */
+function getSheetByName(spreadsheet, newSheetName) {
+  var sheet = spreadsheet.getSheetByName(newSheetName);
+  if (sheet != null) {
+    sheet.clear();
+  } else {
+    sheet = spreadsheet.insertSheet(newSheetName, 0);
+  }
+  return sheet;
+}
+
+function isEmailConfigured() {
+  if (!SEND_EMAIL_ALERT) {
+    return false;
+  }
+  if (!EMAIL_RECIPIENT || EMAIL_RECIPIENT == '<INSERT YOUR EMAIL ID HERE>') {
+    Logger.log("ERROR: Recipient email IDs are not provided");
+    return false;
+  }
+  return true;
+}
+
+function getCurrentTimeStamp() {
+  var timeZone = AdsApp.currentAccount().getTimeZone();
+  var date = new Date();
+  var ts = Utilities.formatDate(date, timeZone, 'yyyyMMddHHmmss')
+  return ts;
+}
+
+/* ******************************************* */
+function cleanAndParseFloat(valueStr) {
+  valueStr = cleanValueStr(valueStr);
+  return parseFloat(valueStr);
+}
+
+function cleanAndParseInt(valueStr) {
+  valueStr = cleanValueStr(valueStr);
+  return parseInt(valueStr);
+}
+
+function cleanValueStr(valueStr) {
+  if (!valueStr) return valueStr;
+  
+  valueStr = valueStr.toString();
+  if (valueStr.charAt(valueStr.length - 1) == '%') {
+    valueStr = valueStr.substring(0, valueStr.length - 1);
+  }
+  valueStr = valueStr.replace(/,/g,'');
+  return valueStr;
+}
+
+function hasValue(valueStr) {
+  return (valueStr && valueStr != "--");
+}
+
+/* 
+* Tracks the execution of the script as an event in Google Analytics.
+* Sends the script name and a random UUID (it is just a random number, required by Analytics).
+* The event information just tells us that somewhere someone ran this script. 
+* Credit for the idea goes to Russel Savage, who posted his version at http://www.freeadwordsscripts.com/2013/11/track-adwords-script-runs-with-google.html.
+* and to Martin Roettgerding, as we learnt the trick from his script at http://www.ppc-epiphany.com/2016/03/11/introducing-the-quality-score-tracker-v3-0
+*/
+function trackEventInAnalytics() {
+  // Create the random UUID from 30 random hex numbers gets them into the format xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx (with y being 8, 9, a, or b).
+  var uuid = 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, 
+    function(c) {var r = Math.random()*16|0,v=c=='x'?r:r&0x3|0x8;return v.toString(16);});
+  var url = "http://www.google-analytics.com/collect?v=1&t=event&tid=UA-46662882-1&cid=" + uuid 
+  + "&ec=AdWords%20Scripts&ea=Script%20Execution&el=Search%20Term%20Trends%20v1";
+  UrlFetchApp.fetch(url);
+}
