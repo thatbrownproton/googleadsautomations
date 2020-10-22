@@ -37,13 +37,13 @@ function main(){
     * If you haven't run the script often enough, the comparison will go as far back as possible.
     * Put 0 to disable the comparison.
     */
-    "chartsCompareStepsBack" : 30,
+    "chartsCompareStepsBack" : 7,
     /*
     * When stats are taken into account (like impressions per QS, or impression weighted QS), this timeframe is used.
     * Note that this affects the values to be tracked and stored. Past values that are already stored won't be affected.
     * Use one of the following: TODAY, YESTERDAY, LAST_7_DAYS, THIS_WEEK_SUN_TODAY, THIS_WEEK_MON_TODAY, LAST_WEEK, LAST_14_DAYS, LAST_30_DAYS, LAST_BUSINESS_WEEK, LAST_WEEK_SUN_SAT, THIS_MONTH
     */
-    "statsTimeframe" : "LAST_30_DAYS",
+    "statsTimeframe" : "LAST_7_DAYS",
     /* 
     * Whether to only look at stats from Google (e.g. for impression weighted QS).
     * Recommended. Quality Score itself only reflects data from Google, so weighting should only take Google into account and leave out search partners.
